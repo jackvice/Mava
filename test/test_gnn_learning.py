@@ -101,7 +101,14 @@ LEARNING_RATE = 3e-3
 
 
 def make_env(num_agents: int = 3, radius: float = VISIBILITY_RADIUS) -> MPEGraphWrapper:
-    """A simple_spread environment with an equal number of agents and landmarks."""
+    """A simple_spread environment with an equal number of agents and landmarks.
+
+    `local_observations` is on because the full simple_spread observation already contains
+    every relative position, so a probe built on it could be solved without ever consulting
+    the graph and the graph-blind controls below would not be controls at all. Using the
+    wrapper's own flag rather than trimming here means these tests exercise the same code
+    path a real local-observation run would.
+    """
     env = MPEWrapper(
         jaxmarl.make(
             "MPE_simple_spread_v3",
@@ -110,6 +117,7 @@ def make_env(num_agents: int = 3, radius: float = VISIBILITY_RADIUS) -> MPEGraph
             local_ratio=0.5,
         ),
         False,
+        local_observations=True,
     )
     return MPEGraphWrapper(env, visibility_radius=radius)
 
@@ -132,23 +140,17 @@ class ProbeData(NamedTuple):
 Probe = Callable[[GraphsTuple, chex.PRNGKey], Tuple[GraphsTuple, chex.Array, chex.Array]]
 
 
-def sample_graphs(env: MPEGraphWrapper, key: chex.PRNGKey, batch_size: int) -> Tuple[Any, Any]:
-    """Resets `batch_size` independent copies of the environment."""
-    states, timesteps = jax.vmap(env.reset)(jax.random.split(key, batch_size))
-    return states, timesteps.observation.graph
+def sample_graphs(
+    env: MPEGraphWrapper, key: chex.PRNGKey, batch_size: int
+) -> Tuple[GraphsTuple, chex.Array]:
+    """Resets `batch_size` independent copies of the environment.
 
-
-def ego_only_observation(env: MPEGraphWrapper, states: Any) -> chex.Array:
-    """The ego's own position and velocity, and nothing else.
-
-    The full simple_spread observation already contains every landmark and agent relative
-    position, so a probe built on it could be solved without the graph. Trimming it to
-    `[pos, vel]` is the local-observation setting the paper actually studies, and it makes
-    the observation-only control provably unable to answer any of the probe questions.
+    Returns the batched graphs and the agents' own observations, which for these envs are
+    the ego's velocity and position only.
     """
-    positions = states.state.p_pos[:, : env.num_agents]
-    velocities = states.state.p_vel[:, : env.num_agents]
-    return jnp.concatenate([positions, velocities], axis=-1)
+    _, timesteps = jax.vmap(env.reset)(jax.random.split(key, batch_size))
+    observation = timesteps.observation
+    return observation.graph, observation.observation.agents_view
 
 
 def to_graph_observation(graph: GraphsTuple, agents_view: chex.Array) -> GraphObservation:
@@ -166,11 +168,14 @@ def make_probe_data(
     env: MPEGraphWrapper, probe: Probe, key: chex.PRNGKey, batch_size: int
 ) -> ProbeData:
     graph_key, probe_key = jax.random.split(key)
-    states, graph = sample_graphs(env, graph_key, batch_size)
+    graph, agents_view = sample_graphs(env, graph_key, batch_size)
     graph, targets, mask = probe(graph, probe_key)
 
-    graph_obs = to_graph_observation(graph, ego_only_observation(env, states))
-    return ProbeData(graph_obs=graph_obs, targets=targets[None], mask=mask[None])
+    return ProbeData(
+        graph_obs=to_graph_observation(graph, agents_view),
+        targets=targets[None],
+        mask=mask[None],
+    )
 
 
 # --------------------------------------------------------------------------------------
@@ -582,7 +587,7 @@ def test_sum_aggregation_counts_better_than_mean() -> None:
 
     A sum can count its terms and a mean cannot, so switching the entity stage to a mean
     has to give something up. The degree probe measures exactly that. Measured: a sum
-    reaches an R^2 of 1.000 and a mean 0.829, against graph-blind controls at 0.27.
+    reaches an R^2 of about 1.00 and a mean about 0.85, against graph-blind controls at 0.28.
 
     So the loss is real but partial - a mean still beats the controls comfortably, because
     the edge features are distances and the average distance to a neighbour carries some
@@ -673,7 +678,9 @@ def test_sum_based_entity_embedding_does_not_transfer() -> None:
     but the consequence is that the embedding entering the attention layers grows with the
     neighbour count: mean absolute activation roughly triples from 3 agents to 10.
     Evaluated outside its training size the model is extrapolating, and the centroid probe
-    degrades from an R^2 of 0.987 at 3 agents to -0.044 at 10.
+    degrades from an R^2 of about 0.99 at 3 agents to somewhere between 0.4 and 0 at 10.
+    That end point moves a lot between runs, which is why the assertion below tests for a
+    large drop rather than a particular value; the drop itself is consistent.
 
     That matters for the paper's headline claim, and it is worth knowing before spending
     GPU hours on the RL version of the experiment.
@@ -693,10 +700,11 @@ def test_sum_based_entity_embedding_does_not_transfer() -> None:
 def test_mean_based_entity_embedding_transfers() -> None:
     """Averaging in `EntityEmbedConv` restores transfer completely.
 
-    Measured R^2 across 3, 7 and 10 agents: 0.999, 0.999, 0.999, against 0.987, 0.734 and
-    -0.044 for the sum. Averaging also happens to fit better at the training size itself,
-    on this probe and on the two-hop probe, presumably because the neighbour count varies
-    within a single graph size too and a sum makes the representation scale with it.
+    Measured R^2 across 3, 7 and 10 agents: about 0.999 at every size, and flat between
+    runs, where the sum falls away from roughly 0.99 to 0.8 to 0.4 or below. Averaging also
+    fits better at the training size itself, on this probe and on the two-hop probe,
+    presumably because the neighbour count varies within a single graph size too and a sum
+    makes the representation scale with it.
 
     The cost is counting ability, which `test_sum_aggregation_counts_better_than_mean`
     measures.

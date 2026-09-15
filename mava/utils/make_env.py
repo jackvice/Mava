@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Tuple, Type, TypeAlias
+from typing import Any, Dict, Tuple, Type, TypeAlias, cast
 
 import gymnasium
 import gymnasium as gym
@@ -35,7 +35,7 @@ from jumanji.environments.routing.lbf.generator import (
 from jumanji.environments.routing.robot_warehouse.generator import (
     RandomGenerator as RwareRandomGenerator,
 )
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from mava.types import MarlEnv
 from mava.utils.network_utils import is_gnn_based
@@ -93,6 +93,19 @@ _gym_registry: registry_type = {
 }
 
 
+def _wrapper_kwargs(config: DictConfig, key: str) -> Dict[str, Any]:
+    """Reads an optional dict of wrapper keyword arguments from the env config.
+
+    Environment wrappers are constructed here rather than by Hydra, so options such as the
+    MPE visibility radius are only reachable if the env config can pass them through. Envs
+    that do not define `key` get no extra arguments and keep their wrapper defaults.
+    """
+    kwargs = config.env.get(key)
+    if not kwargs:
+        return {}
+    return cast(Dict[str, Any], OmegaConf.to_container(kwargs, resolve=True))
+
+
 def add_extra_wrappers(
     train_env: MarlEnv, eval_env: MarlEnv, config: DictConfig, registry: registry_type
 ) -> Tuple[MarlEnv, MarlEnv]:
@@ -110,8 +123,9 @@ def add_extra_wrappers(
     if is_gnn_based(config):
         # Get the graph wrapper from registry or use default GraphWrapper
         graph_wrapper = registry[config.env.env_name].get("graph_wrapper", GraphWrapper)
-        train_env = graph_wrapper(train_env)
-        eval_env = graph_wrapper(eval_env)
+        graph_kwargs = _wrapper_kwargs(config, "graph_wrapper_kwargs")
+        train_env = graph_wrapper(train_env, **graph_kwargs)
+        eval_env = graph_wrapper(eval_env, **graph_kwargs)
 
     train_env = AutoResetWrapper(train_env)
     train_env = RecordEpisodeMetrics(train_env)
@@ -173,13 +187,16 @@ def make_jaxmarl_env(config: DictConfig, add_global_state: bool = False) -> Tupl
         kwargs.update(config.env.scenario.task_config)
 
     # Create jaxmarl envs.
+    wrapper_kwargs = _wrapper_kwargs(config, "wrapper_kwargs")
     train_env: MarlEnv = _jaxmarl_registry[config.env.env_name]["wrapper"](
         jaxmarl.make(config.env.scenario.name, **kwargs),
         add_global_state,
+        **wrapper_kwargs,
     )
     eval_env: MarlEnv = _jaxmarl_registry[config.env.env_name]["wrapper"](
         jaxmarl.make(config.env.scenario.name, **kwargs),
         add_global_state,
+        **wrapper_kwargs,
     )
 
     train_env, eval_env = add_extra_wrappers(train_env, eval_env, config, _jaxmarl_registry)

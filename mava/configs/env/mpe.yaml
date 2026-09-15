@@ -17,3 +17,30 @@ log_win_rate: False
 kwargs:
   # Note: We only support `Continuous` actions for now but the `Discrete` version works as well.
   action_type: Continuous # Whether agent action spaces are "Continuous" or "Discrete".
+
+# Forwarded to MPEWrapper.
+wrapper_kwargs:
+  # Restrict each agent's observation to its own [velocity, position]. The default MPE
+  # observation already contains every landmark and other-agent relative position, which is
+  # the "global" condition of https://arxiv.org/abs/2211.02127. Because a graph torso
+  # concatenates its embedding onto that observation, comparing `network=rnn_graph` against
+  # `network=rnn` at this default asks whether extra information helps, not whether the
+  # graph can replace global information. Set this to True to make the graph the only
+  # source of information about other entities, which is the paper's comparison. The
+  # centralised critic's `global_state` is unaffected either way.
+  #
+  # This is also what makes the actor's input width independent of the scenario size (4 at
+  # 3, 5 and 10 agents, against 18, 30 and 60 by default), so a checkpoint can be evaluated
+  # at a size it was not trained on. Note that `system.add_agent_id` must be False for that
+  # to hold, since the one-hot it prepends is as long as the number of agents.
+  local_observations: False
+
+# Forwarded to MPEGraphWrapper, and only used when the network is graph based.
+graph_wrapper_kwargs:
+  # Entities within this distance of each other are connected. Note that at the default of
+  # 1.0 the graph is close to complete (24 of 36 possible edges with 3 agents), which
+  # erases most of the locality the architecture exists to exploit; smaller radii are the
+  # interesting regime. See Figure 7 of the paper.
+  visibility_radius: 1.0
+  # Table 4 of the paper. The attention layer's root term supplies the self contribution.
+  add_self_loops: False

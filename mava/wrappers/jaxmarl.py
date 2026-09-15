@@ -422,15 +422,72 @@ class MabraxWrapper(JaxMarlWrapper):
 
 
 class MPEWrapper(JaxMarlWrapper):
-    """Wrapper for the MPE environment."""
+    """Wrapper for the MPE environment.
+
+    Set `local_observations` to restrict each agent's view to itself. The MPE observation is
+
+        [self_vel (2), self_pos (2), landmark_rel_pos, other_agent_rel_pos, comm]
+
+    so it already contains the relative position of every landmark and every other agent.
+    That is the *global* condition in https://arxiv.org/abs/2211.02127, and leaving it in
+    place makes a graph torso strictly better informed than an MLP on the same observation,
+    since the torso concatenates its graph embedding onto it. "The GNN beats the MLP" is
+    then close to tautological.
+
+    The paper's actual claim is that a GNN with only local information matches an MLP with
+    global information. Trimming the observation to the leading four columns leaves the
+    agent knowing only its own velocity and position, so the graph becomes the only source
+    of information about anything else, and the comparison becomes the one the paper makes.
+
+    Only the actor's view is restricted. `global_state` is left intact, because the critic
+    is centralised both in the paper and in MAPPO.
+    """
+
+    # [self_vel (2), self_pos (2)]
+    _num_ego_observation_features = 4
 
     def __init__(
         self,
         env: SimpleSpreadMPE,
         has_global_state: bool = False,
+        local_observations: bool = False,
     ):
+        # Set before delegating: `jumanji.Environment.__init__` reads `observation_spec`,
+        # which needs this flag.
+        self.local_observations = local_observations
+
         super().__init__(env, has_global_state, env.max_steps)
         self._env: SimpleSpreadMPE
+
+    def _create_observation(
+        self,
+        obs: Dict[str, Array],
+        wrapped_env_state: Any,
+    ) -> Union[Observation, ObservationGlobalState]:
+        observation = super()._create_observation(obs, wrapped_env_state)
+        if not self.local_observations:
+            return observation
+
+        return observation._replace(
+            agents_view=observation.agents_view[..., : self._num_ego_observation_features]
+        )
+
+    @cached_property
+    def observation_spec(self) -> specs.Spec:
+        spec = super().observation_spec
+        if not self.local_observations:
+            return spec
+
+        agents_view = spec.agents_view
+        return spec.replace(
+            agents_view=specs.BoundedArray(
+                shape=(*agents_view.shape[:-1], self._num_ego_observation_features),
+                dtype=agents_view.dtype,
+                minimum=agents_view.minimum,
+                maximum=agents_view.maximum,
+                name=agents_view.name,
+            )
+        )
 
     @cached_property
     def action_dim(self) -> chex.Array:

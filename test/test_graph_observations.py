@@ -21,7 +21,7 @@ GAT layer.
 """
 
 import importlib
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import chex
 import jax
@@ -34,6 +34,8 @@ from omegaconf import DictConfig, OmegaConf
 from mava.networks.gnn import InforMARLGlobalAggregationTorso, InforMARLNbrhdAggregationTorso
 from mava.types import GraphObservation, GraphsTuple, Observation
 from mava.utils.graph.gnn_utils import batched_graph_to_single_graph
+from mava.utils.make_env import make
+from mava.wrappers import AgentIDWrapper
 from mava.wrappers.graph_wrapper import GraphWrapper
 from mava.wrappers.jaxmarl import MPEGraphWrapper, MPEWrapper
 from test.utils import ConfigValue, find_replace
@@ -209,6 +211,126 @@ def test_step_keeps_graph_observation() -> None:
     assert isinstance(next_timestep.observation, GraphObservation)
     chex.assert_trees_all_equal_shapes(
         timestep.observation.graph, next_timestep.observation.graph
+    )
+
+
+# --------------------------------------------------------------------------------------
+# Local observations
+# --------------------------------------------------------------------------------------
+
+
+def make_local_obs_env(
+    num_agents: int = NUM_AGENTS, local: bool = True, add_agent_id: bool = False
+) -> MPEGraphWrapper:
+    """Builds the MPE graph env, optionally with local observations and agent IDs.
+
+    Agent IDs are applied between the two wrappers, mirroring `add_extra_wrappers`.
+    """
+    env: Any = MPEWrapper(
+        jaxmarl.make(
+            "MPE_simple_spread_v3",
+            num_agents=num_agents,
+            num_landmarks=num_agents,
+            local_ratio=0.5,
+        ),
+        True,
+        local_observations=local,
+    )
+    if add_agent_id:
+        env = AgentIDWrapper(env)
+    return MPEGraphWrapper(env, visibility_radius=1.0)
+
+
+def test_local_observation_is_ego_velocity_and_position() -> None:
+    """The trimmed observation must be exactly the ego's own state, and nothing else.
+
+    The default MPE observation also carries every landmark and other-agent relative
+    position. Leaving that in means a graph torso sees strictly more than an MLP on the same
+    observation, so `network=rnn_graph` versus `network=rnn` cannot test the paper's claim.
+    """
+    env = make_local_obs_env()
+    state, timestep = env.reset(jax.random.PRNGKey(0))
+    agents_view = timestep.observation.observation.agents_view
+
+    assert agents_view.shape == (NUM_AGENTS, 4)
+    expected = jnp.concatenate(
+        [state.state.p_vel[:NUM_AGENTS], state.state.p_pos[:NUM_AGENTS]], axis=-1
+    )
+    chex.assert_trees_all_close(agents_view, expected, atol=1e-6)
+
+
+def test_local_observation_leaves_the_graph_and_critic_untouched() -> None:
+    """Only the actor's view is restricted: the graph and the global state must be intact."""
+    full = make_local_obs_env(local=False)
+    local = make_local_obs_env(local=True)
+
+    key = jax.random.PRNGKey(0)
+    _, full_ts = full.reset(key)
+    _, local_ts = local.reset(key)
+
+    chex.assert_trees_all_close(full_ts.observation.graph, local_ts.observation.graph)
+    chex.assert_trees_all_close(
+        full_ts.observation.observation.global_state, local_ts.observation.observation.global_state
+    )
+    assert local_ts.observation.observation.agents_view.shape[-1] == 4
+    assert full_ts.observation.observation.agents_view.shape[-1] > 4
+
+
+@pytest.mark.parametrize("local", [False, True])
+@pytest.mark.parametrize("add_agent_id", [False, True])
+def test_local_observation_spec_matches_emitted_observation(local: bool, add_agent_id: bool) -> None:
+    """A spec that disagrees with the data corrupts the replay buffer rather than crashing."""
+    env = make_local_obs_env(local=local, add_agent_id=add_agent_id)
+    _, timestep = env.reset(jax.random.PRNGKey(0))
+
+    spec = env.observation_spec.observation
+    observation = timestep.observation.observation
+    assert observation.agents_view.shape == spec.agents_view.shape
+    assert observation.agents_view.dtype == spec.agents_view.dtype
+
+
+def test_local_observation_preserves_prepended_agent_ids() -> None:
+    """Trimming happens before `AgentIDWrapper`, so the one-hot must survive as a prefix.
+
+    This is the ordering trap: `add_agent_id` defaults to True for every PPO system and
+    prepends a one-hot, so trimming the observation to its first four columns *after* that
+    wrapper would silently return agent IDs instead of the agent's own state.
+    """
+    env = make_local_obs_env(local=True, add_agent_id=True)
+    state, timestep = env.reset(jax.random.PRNGKey(0))
+    agents_view = timestep.observation.observation.agents_view
+
+    assert agents_view.shape == (NUM_AGENTS, NUM_AGENTS + 4)
+    chex.assert_trees_all_close(agents_view[:, :NUM_AGENTS], jnp.eye(NUM_AGENTS))
+    expected = jnp.concatenate(
+        [state.state.p_vel[:NUM_AGENTS], state.state.p_pos[:NUM_AGENTS]], axis=-1
+    )
+    chex.assert_trees_all_close(agents_view[:, NUM_AGENTS:], expected, atol=1e-6)
+
+
+def test_local_observation_width_is_independent_of_scenario_size() -> None:
+    """Scale transfer needs a policy input whose width does not depend on the agent count.
+
+    Measured widths are 18, 30 and 60 by default against a constant 4 when local, which is
+    why the default MLP baseline cannot even load a checkpoint from another scenario size.
+    Agent IDs reintroduce the dependence, because the one-hot is as long as the agent count,
+    so `system.add_agent_id` has to be False for a transfer experiment.
+    """
+
+    def width(num_agents: int, **kwargs: bool) -> int:
+        env = make_local_obs_env(num_agents=num_agents, **kwargs)
+        _, timestep = env.reset(jax.random.PRNGKey(0))
+        return int(timestep.observation.observation.agents_view.shape[-1])
+
+    sizes = (3, 5, 10)
+    local = {n: width(n, local=True) for n in sizes}
+    default = {n: width(n, local=False) for n in sizes}
+    local_with_ids = {n: width(n, local=True, add_agent_id=True) for n in sizes}
+
+    assert len(set(local.values())) == 1, f"local width should be constant, got {local}"
+    assert len(set(default.values())) == len(sizes), f"default width should grow, got {default}"
+    assert len(set(local_with_ids.values())) == len(sizes), (
+        f"agent IDs should reintroduce size dependence, got {local_with_ids}"
     )
 
 
@@ -585,6 +707,17 @@ def test_two_layers_reach_second_order_neighbours() -> None:
     [
         ("ppo.anakin.rec_ippo", "mpe", []),
         ("ppo.anakin.rec_mappo", "mpe", []),
+        # The paper's setting: the actor sees only its own state and the graph supplies
+        # everything else. Agent IDs are off so the actor input stays size independent.
+        (
+            "ppo.anakin.rec_mappo",
+            "mpe",
+            [
+                "env.wrapper_kwargs.local_observations=True",
+                "env.graph_wrapper_kwargs.visibility_radius=0.5",
+                "system.add_agent_id=False",
+            ],
+        ),
         # The default fully-connected GraphWrapper has no entity type in its node features.
         (
             "ppo.anakin.rec_ippo",
@@ -619,6 +752,37 @@ def test_gnn_systems_run(
 
     system = importlib.import_module(f"mava.systems.{system_path}")
     system.run_experiment(cfg)
+
+
+def test_env_config_reaches_the_wrappers() -> None:
+    """The wrapper options must be settable from config, not just from Python.
+
+    The wrappers are constructed in `add_extra_wrappers` rather than by Hydra, so without
+    an explicit path from the env config these options would be unreachable in a real run
+    and the local-observation setting would be dead code.
+    """
+    with initialize(version_base=None, config_path="../mava/configs/default"):
+        cfg: DictConfig = compose(
+            config_name="rec_mappo",
+            overrides=[
+                "env=mpe",
+                "network=rnn_graph",
+                "env.wrapper_kwargs.local_observations=True",
+                "env.graph_wrapper_kwargs.visibility_radius=0.4",
+                "system.add_agent_id=False",
+            ],
+        )
+
+    train_env, eval_env = make(cfg, add_global_state=True)
+    for env in (train_env, eval_env):
+        # Jumanji wrappers forward unknown attributes down the chain to MPEWrapper.
+        assert env.local_observations is True
+        _, timestep = env.reset(jax.random.PRNGKey(0))
+        assert timestep.observation.observation.agents_view.shape[-1] == 4
+
+    graph = timestep.observation.graph
+    distances = graph.edges[..., 0][graph.senders >= 0]
+    assert jnp.all(distances <= 0.4 + 1e-6), "visibility_radius did not reach the wrapper"
 
 
 def test_feedforward_systems_reject_graph_observations() -> None:
