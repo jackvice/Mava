@@ -38,10 +38,17 @@ sac_systems = ["sac.anakin.ff_isac", "sac.anakin.ff_masac", "sac.anakin.ff_hasac
 q_learning_systems = ["q_learning.anakin.rec_iql", "q_learning.anakin.rec_qmix"]
 transformer_systems = ["mat.anakin.mat"]
 sable_systems = ["sable.anakin.ff_sable", "sable.anakin.rec_sable"]
+# The GNN torsos assume three batch dims (time, env, agent), so only recurrent systems
+# can consume graph observations.
+graph_systems = ["ppo.anakin.rec_ippo", "ppo.anakin.rec_mappo"]
 
 discrete_envs = ["gigastep", "lbf", "matrax", "rware", "smax", "vector-connector"]
 cnn_envs = ["cleaner", "connector"]
 continuous_envs = ["mabrax", "mpe"]
+# Envs runnable with graph observations, mapped to the number of entity types in their
+# node features. Only the MPE wrapper appends an entity type; everything else falls back
+# to the generic fully-connected GraphWrapper, whose node features have none.
+graph_envs = {"mpe": 2, "rware": 0}
 
 
 def _run_system(system_name: str, cfg: DictConfig) -> float:
@@ -73,6 +80,26 @@ def test_ppo_system(fast_config: dict, system_path: str) -> None:
 
     with initialize(version_base=None, config_path=config_path):
         cfg = compose(config_name=f"{system_name}", overrides=[f"env={env}"])
+        cfg = _get_fast_config(cfg, fast_config)
+
+    _run_system(system_path, cfg)
+
+
+@pytest.mark.parametrize("system_path", graph_systems)
+def test_graph_system(fast_config: dict, system_path: str) -> None:
+    """Test GNN-based systems on random graph-capable envs."""
+    _, _, system_name = system_path.split(".")
+    env = random.choice(list(graph_envs))
+    num_entity_types = graph_envs[env]
+
+    overrides = [
+        f"env={env}",
+        "network=rnn_graph",
+        f"network.actor_network.pre_torso.num_entity_types={num_entity_types}",
+        f"network.critic_network.pre_torso.num_entity_types={num_entity_types}",
+    ]
+    with initialize(version_base=None, config_path=config_path):
+        cfg = compose(config_name=f"{system_name}", overrides=overrides)
         cfg = _get_fast_config(cfg, fast_config)
 
     _run_system(system_path, cfg)

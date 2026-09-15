@@ -82,6 +82,7 @@ class GraphWrapper(Wrapper):
                 n_node_per_graph=self.num_agents,
                 n_graph=1,
                 node_features=observation.agents_view,
+                add_self_edges=self.add_self_loops,
             )
             return GraphsTuple(
                 **base._asdict(),
@@ -115,7 +116,8 @@ class GraphWrapper(Wrapper):
         """Define the observation spec for the Jraph graph representation."""
         obs_spec = self._env.observation_spec
 
-        max_n_edge = self.num_agents * self.num_agents
+        edges_per_node = self.num_agents if self.add_self_loops else self.num_agents - 1
+        max_n_edge = self.num_agents * edges_per_node
 
         graph_spec = specs.Spec(
             constructor=GraphsTuple,

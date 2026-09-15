@@ -1,30 +1,44 @@
-# ---Recurrent Structure Networks---
-hidden_state_dim: 128 # The size of the RNN hiddenstate for each agent.
+# ---Recurrent Graph (InforMARL) Networks---
+# Defaults follow Tables 4 and 7 of https://arxiv.org/abs/2211.02127.
+# NOTE: `num_entity_types` must match the graph wrapper. The MPE wrapper appends an
+# entity type (agent/landmark) to its node features, so it needs 2. The generic
+# `GraphWrapper` does not, so other environments must set `num_entity_types: 0`.
+hidden_state_dim: 64 # The size of the RNN hiddenstate for each agent.
 
 actor_network:
   pre_torso:
     _target_: mava.networks.gnn.InforMARLNbrhdAggregationTorso
-    attention_query_layer_sizes: [128]
+    attention_query_layer_sizes: [16]
     use_layer_norm: False
     activation: relu
-    num_heads: 4
-    num_attention_layers: 1
+    num_heads: 3
+    num_attention_layers: 2
+    concat_heads: False
+    num_entity_types: 2
+    entity_embedding_size: 3
+    entity_embed_layer_sizes: [16]
+    entity_embed_aggregation: sum
   post_torso:
     _target_: mava.networks.torsos.MLPTorso
-    layer_sizes: [128]
+    layer_sizes: [64, 64]
     use_layer_norm: False
     activation: relu
 
 critic_network:
   pre_torso:
     _target_: mava.networks.gnn.InforMARLGlobalAggregationTorso
-    attention_query_layer_sizes: [128]
+    attention_query_layer_sizes: [16]
     use_layer_norm: False
     activation: relu
-    num_heads: 4
-    num_attention_layers: 1
+    num_heads: 3
+    num_attention_layers: 2
+    concat_heads: False
+    num_entity_types: 2
+    entity_embedding_size: 3
+    entity_embed_layer_sizes: [16]
+    entity_embed_aggregation: sum
   post_torso:
     _target_: mava.networks.torsos.MLPTorso
-    layer_sizes: [128]
+    layer_sizes: [64, 64]
     use_layer_norm: False
     activation: relu

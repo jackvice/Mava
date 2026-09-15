@@ -168,14 +168,27 @@ def batch(graphs: List[GraphsTuple]) -> GraphsTuple:
         concat = lambda *args: jnp.concatenate(args)
         return jax.tree.map(concat, *nests)
 
+    def _offset_node_indices(indices: chex.Array, offset: chex.Array) -> chex.Array:
+        """Shifts node indices by `offset`, leaving negative padding sentinels intact.
+
+        Wrappers pad unused edges with -1 so that jraph's segment operations discard them.
+        Adding the offset unconditionally would turn -1 into a valid index for the previous
+        sub-graph's last node, silently injecting spurious messages.
+        """
+        return jnp.where(indices < 0, indices, indices + offset)
+
     return GraphsTuple(
         n_node=jnp.concatenate([g.n_node for g in graphs]),
         n_edge=jnp.concatenate([g.n_edge for g in graphs]),
         nodes=_map_concat([g.nodes for g in graphs]),
         edges=_map_concat([g.edges for g in graphs]),
         globals=_map_concat([g.globals for g in graphs]),
-        senders=jnp.concatenate([g.senders + o for g, o in zip(graphs, offsets, strict=False)]),
-        receivers=jnp.concatenate([g.receivers + o for g, o in zip(graphs, offsets, strict=False)]),
+        senders=jnp.concatenate(
+            [_offset_node_indices(g.senders, o) for g, o in zip(graphs, offsets, strict=False)]
+        ),
+        receivers=jnp.concatenate(
+            [_offset_node_indices(g.receivers, o) for g, o in zip(graphs, offsets, strict=False)]
+        ),
         ego_node_index=jnp.concatenate(
             [g.ego_node_index + o for g, o in zip(graphs, offsets, strict=False)]
         ),

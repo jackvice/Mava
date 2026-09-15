@@ -82,6 +82,11 @@ version = { attr = "mava.__version__" }
 "Homepage" = "https://github.com/instadeep/Mava"
 "Bug Tracker" = "https://github.com/instadeep/Mava/issues"
 
+[tool.pytest.ini_options]
+markers = [
+  "slow: functional tests that train a network; excluded from the default run with -m 'not slow'",
+]
+
 [tool.mypy]
 python_version = "3.10"
 warn_redundant_casts = true

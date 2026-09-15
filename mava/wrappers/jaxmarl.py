@@ -487,7 +487,7 @@ class MPEGraphWrapper(GraphWrapper):
     def __init__(
         self,
         env: MPEWrapper,
-        add_self_loops: bool = True,
+        add_self_loops: bool = False,
         visibility_radius: float = 1,
     ):
         super().__init__(env)
@@ -501,7 +501,10 @@ class MPEGraphWrapper(GraphWrapper):
         self.action_dim = self._env.action_dim
 
         self.num_entities = self._env.num_entities
-        self.node_features_dim = 4
+        # [relative_x, relative_y, relative_vx, relative_vy, entity_type]
+        self.node_features_dim = 5
+        # Agents and landmarks. MPE scenarios used here have no obstacles.
+        self.num_entity_types = 2
 
     def visibility_graph_for_ego(
         self,
@@ -540,8 +543,17 @@ class MPEGraphWrapper(GraphWrapper):
         # for invalid edges, edge feature would be 0.0
         edge_features = safe_dists[safe_senders, safe_receivers][..., None]
 
+        # The reference implementation also includes each entity's relative goal position.
+        # The simple_spread scenarios used here are coverage tasks with no per-agent goal
+        # assignment, so there is no goal to report and it is omitted.
+        entity_type = (jnp.arange(self.num_entities) >= self._env.num_agents).astype(jnp.float32)
         node_features = jnp.concatenate(
-            [positions - positions[ego_idx], state.p_vel - state.p_vel[ego_idx]], axis=-1
+            [
+                positions - positions[ego_idx],
+                state.p_vel - state.p_vel[ego_idx],
+                entity_type[:, None],
+            ],
+            axis=-1,
         )
         assert node_features.shape[-1] == self.node_features_dim, (
             f"Node features dim specified in MPEWrapper is {self.node_features_dim}, "
