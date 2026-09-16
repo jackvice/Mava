@@ -191,10 +191,12 @@ def get_learner_step_fn(
 
         # Calculate advantage
         params, opt_states, key, _, final_timestep = learner_state
-        last_val = critic_apply_fn(params.critic_params, final_timestep.observation)
-        last_done = np.repeat(final_timestep.last(), config.system.num_agents).reshape(num_envs, -1)
+        final_val = critic_apply_fn(params.critic_params, final_timestep.observation)
+        final_done = np.repeat(final_timestep.last(), config.system.num_agents).reshape(
+            num_envs, -1
+        )
         advantages, targets = calculate_gae(
-            traj_batch, last_val, last_done, config.system.gamma, config.system.gae_lambda
+            traj_batch, final_val, final_done, config.system.gamma, config.system.gae_lambda
         )
 
         def _update_epoch(update_state: Tuple, _: Any) -> Tuple[Tuple, Metrics]:
@@ -210,7 +212,7 @@ def get_learner_step_fn(
                 def _actor_loss_fn(
                     actor_params: FrozenDict,
                     traj_batch: PPOTransition,
-                    gae: chex.Array,
+                    gae: jax.Array,
                     key: chex.PRNGKey,
                 ) -> Tuple:
                     """Calculate the actor loss."""
@@ -239,7 +241,7 @@ def get_learner_step_fn(
                     return total_actor_loss, (actor_loss, entropy)
 
                 def _critic_loss_fn(
-                    critic_params: FrozenDict, traj_batch: PPOTransition, targets: chex.Array
+                    critic_params: FrozenDict, traj_batch: PPOTransition, targets: jax.Array
                 ) -> Tuple:
                     """Calculate the critic loss."""
                     # Rerun network
@@ -358,7 +360,7 @@ def get_learner_step_fn(
                 - opt_states (OptStates): The initial optimizer state.
                 - key (chex.PRNGKey): The random number generator state.
                 - env_state (LogEnvState): The environment state.
-                - timesteps (TimeStep): The last timestep of the rollout.
+                - timesteps (TimeStep): The final timestep of the rollout.
         """
         # This function is shard mapped on the batch axis, but `_update_step` needs
         # the first axis to be time

@@ -49,6 +49,7 @@ from mava.utils.jax_utils import (
     unreplicate_n_dims,
 )
 from mava.utils.logger import LogEvent, MavaLogger
+from mava.utils.multistep import calculate_gae
 from mava.utils.network_utils import get_action_head
 from mava.utils.training import make_learning_rate
 from mava.wrappers.episode_metrics import get_final_step_metrics
@@ -80,7 +81,7 @@ def get_learner_fn(
                 - opt_state: The current optimizer states.
                 - key: The random number generator state.
                 - env_state: The environment state.
-                - last_timestep: The last timestep in the current trajectory.
+                - prev_timestep: The previous environment timestep.
             _ (Any): The current metrics info.
         """
 
@@ -88,21 +89,23 @@ def get_learner_fn(
             learner_state: LearnerState, _: Any
         ) -> Tuple[LearnerState, Tuple[PPOTransition, Metrics]]:
             """Step the environment."""
-            params, opt_state, key, env_state, last_timestep = learner_state
+            params, opt_state, key, env_state, prev_timestep = learner_state
 
             # Select action
             key, policy_key = jax.random.split(key)
             action, log_prob, value = actor_action_select_fn(  # type: ignore
                 params,
-                last_timestep.observation,
+                prev_timestep.observation,
                 policy_key,
             )
             # Step environment
             env_state, timestep = jax.vmap(env.step, in_axes=(0, 0))(env_state, action)
 
-            done = timestep.last().repeat(env.num_agents).reshape(config.arch.num_envs, -1)
+            prev_done = (
+                prev_timestep.last().repeat(env.num_agents).reshape(config.arch.num_envs, -1)
+            )
             transition = PPOTransition(
-                done, action, value, timestep.reward, log_prob, last_timestep.observation
+                prev_done, action, value, timestep.reward, log_prob, prev_timestep.observation
             )
             learner_state = LearnerState(params, opt_state, key, env_state, timestep)
 
@@ -115,43 +118,18 @@ def get_learner_fn(
         )
 
         # Calculate advantage
-        params, opt_state, key, env_state, last_timestep = learner_state
+        params, opt_state, key, env_state, final_timestep = learner_state
 
-        key, last_val_key = jax.random.split(key)
-        _, _, last_val = actor_action_select_fn(  # type: ignore
+        key, final_val_key = jax.random.split(key)
+        _, _, final_val = actor_action_select_fn(  # type: ignore
             params,
-            last_timestep.observation,
-            last_val_key,
+            final_timestep.observation,
+            final_val_key,
         )
-
-        def _calculate_gae(
-            traj_batch: PPOTransition, last_val: chex.Array
-        ) -> Tuple[chex.Array, chex.Array]:
-            """Calculate the GAE."""
-
-            def _get_advantages(gae_and_next_value: Tuple, transition: PPOTransition) -> Tuple:
-                """Calculate the GAE for a single transition."""
-                gae, next_value = gae_and_next_value
-                done, value, reward = (
-                    transition.done,
-                    transition.value,
-                    transition.reward,
-                )
-                gamma = config.system.gamma
-                delta = reward + gamma * next_value * (1 - done) - value
-                gae = delta + gamma * config.system.gae_lambda * (1 - done) * gae
-                return (gae, value), gae
-
-            _, advantages = jax.lax.scan(
-                _get_advantages,
-                (jnp.zeros_like(last_val), last_val),
-                traj_batch,
-                reverse=True,
-                unroll=16,
-            )
-            return advantages, advantages + traj_batch.value
-
-        advantages, targets = _calculate_gae(traj_batch, last_val)
+        final_done = final_timestep.last().repeat(env.num_agents).reshape(config.arch.num_envs, -1)
+        advantages, targets = calculate_gae(
+            traj_batch, final_val, final_done, config.system.gamma, config.system.gae_lambda
+        )
 
         def _update_epoch(update_state: Tuple, _: Any) -> Tuple:
             """Update the network for a single epoch."""
@@ -164,8 +142,8 @@ def get_learner_fn(
                 def _loss_fn(
                     params: FrozenDict,
                     traj_batch: PPOTransition,
-                    gae: chex.Array,
-                    value_targets: chex.Array,
+                    gae: jax.Array,
+                    value_targets: jax.Array,
                     entropy_key: chex.PRNGKey,
                 ) -> Tuple:
                     """Calculate the actor loss."""
@@ -278,7 +256,7 @@ def get_learner_fn(
         )
 
         params, opt_state, traj_batch, advantages, targets, key = update_state
-        learner_state = LearnerState(params, opt_state, key, env_state, last_timestep)
+        learner_state = LearnerState(params, opt_state, key, env_state, final_timestep)
 
         return learner_state, (episode_metrics, loss_info)
 
@@ -313,7 +291,7 @@ def get_learner_fn(
 
 
 def learner_setup(
-    env: MarlEnv, keys: chex.Array, config: DictConfig
+    env: MarlEnv, keys: jax.Array, config: DictConfig
 ) -> Tuple[LearnerFn[LearnerState], Any, LearnerState]:
     """Initialise learner_fn, network, optimiser, environment and states."""
     # Get available TPU cores.
@@ -432,7 +410,7 @@ def run_experiment(_config: DictConfig) -> float:
         timestep: TimeStep,
         key: chex.PRNGKey,
         actor_state: ActorState,
-    ) -> Tuple[chex.Array, ActorState]:
+    ) -> Tuple[jax.Array, ActorState]:
         """The acting function that get's passed to the evaluator.
         Given that the MAT network has a `get_actions` method we define this eval_act_fn
         accordingly.

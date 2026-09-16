@@ -50,6 +50,7 @@ from mava.utils.jax_utils import (
     unreplicate_n_dims,
 )
 from mava.utils.logger import LogEvent, MavaLogger
+from mava.utils.multistep import calculate_gae
 from mava.utils.network_utils import get_action_head
 from mava.utils.training import make_learning_rate
 from mava.wrappers.episode_metrics import get_final_step_metrics
@@ -82,7 +83,7 @@ def get_learner_fn(
                 - opt_states (OptState): The current optimizer states.
                 - key (PRNGKey): The random number generator state.
                 - env_state (State): The environment state.
-                - last_timestep (TimeStep): The last timestep in the current trajectory.
+                - prev_timestep (TimeStep): The previous environment timestep.
                 - hstates (HiddenStates): The hidden state of the network.
             _ (Any): The current metrics info.
 
@@ -92,16 +93,16 @@ def get_learner_fn(
             learner_state: LearnerState, _: Any
         ) -> Tuple[LearnerState, Tuple[Transition, Metrics]]:
             """Step the environment."""
-            params, opt_states, key, env_state, last_timestep, hstates = learner_state
+            params, opt_states, key, env_state, prev_timestep, hstates = learner_state
 
             # Select action
             key, policy_key = jax.random.split(key)
 
             # Apply the actor network to get the action, log_prob, value and updated hstates.
-            last_obs = last_timestep.observation
+            prev_obs = prev_timestep.observation
             action, log_prob, value, hstates = sable_action_select_fn(  # type: ignore
                 params,
-                last_obs,
+                prev_obs,
                 hstates,
                 policy_key,
             )
@@ -114,9 +115,9 @@ def get_learner_fn(
             done = jnp.expand_dims(done, (1, 2, 3, 4))
             hstates = tree.map(lambda hs: jnp.where(done, jnp.zeros_like(hs), hs), hstates)
 
-            prev_done = last_timestep.last().repeat(env.num_agents).reshape(num_envs, -1)
+            prev_done = prev_timestep.last().repeat(env.num_agents).reshape(num_envs, -1)
             transition = Transition(
-                prev_done, action, value, timestep.reward, log_prob, last_timestep.observation
+                prev_done, action, value, timestep.reward, log_prob, prev_timestep.observation
             )
             learner_state = LearnerState(params, opt_states, key, env_state, timestep, hstates)
             metrics = timestep.extras["episode_metrics"] | timestep.extras["env_metrics"]
@@ -131,45 +132,15 @@ def get_learner_fn(
         )
 
         # Calculate advantage
-        params, opt_states, key, env_state, last_timestep, updated_hstates = learner_state
-        key, last_val_key = jax.random.split(key)
-        _, _, last_val, _ = sable_action_select_fn(  # type: ignore
-            params, last_timestep.observation, updated_hstates, last_val_key
+        params, opt_states, key, env_state, final_timestep, updated_hstates = learner_state
+        key, final_val_key = jax.random.split(key)
+        _, _, final_val, _ = sable_action_select_fn(  # type: ignore
+            params, final_timestep.observation, updated_hstates, final_val_key
         )
-        last_done = last_timestep.last().repeat(env.num_agents).reshape(num_envs, -1)
-
-        def _calculate_gae(
-            traj_batch: Transition,
-            current_val: chex.Array,
-            current_done: chex.Array,
-        ) -> Tuple[chex.Array, chex.Array]:
-            """Calculate the GAE."""
-
-            def _get_advantages(
-                carry: Tuple[chex.Array, chex.Array, chex.Array], transition: Transition
-            ) -> Tuple[Tuple[chex.Array, chex.Array, chex.Array], chex.Array]:
-                """Calculate the GAE for a single transition."""
-                gae, next_value, next_done = carry
-                done, value, reward = (
-                    transition.done,
-                    transition.value,
-                    transition.reward,
-                )
-                gamma = config.system.gamma
-                delta = reward + gamma * next_value * (1 - next_done) - value
-                gae = delta + gamma * config.system.gae_lambda * (1 - next_done) * gae
-                return (gae, value, done), gae
-
-            _, advantages = jax.lax.scan(
-                _get_advantages,
-                (jnp.zeros_like(current_val), current_val, current_done),
-                traj_batch,
-                reverse=True,
-                unroll=16,
-            )
-            return advantages, advantages + traj_batch.value
-
-        advantages, targets = _calculate_gae(traj_batch, last_val, last_done)
+        final_done = final_timestep.last().repeat(env.num_agents).reshape(num_envs, -1)
+        advantages, targets = calculate_gae(
+            traj_batch, final_val, final_done, config.system.gamma, config.system.gae_lambda
+        )
 
         def _update_epoch(update_state: Tuple, _: Any) -> Tuple:
             """Update the network for a single epoch."""
@@ -182,8 +153,8 @@ def get_learner_fn(
                 def _loss_fn(
                     params: Params,
                     traj_batch: Transition,
-                    gae: chex.Array,
-                    value_targets: chex.Array,
+                    gae: jax.Array,
+                    value_targets: jax.Array,
                     prev_hstates: HiddenStates,
                     rng_key: chex.PRNGKey,
                 ) -> Tuple:
@@ -316,7 +287,7 @@ def get_learner_fn(
             opt_states,
             key,
             env_state,
-            last_timestep,
+            final_timestep,
             updated_hstates,
         )
         return learner_state, (episode_metrics, loss_info)
@@ -354,7 +325,7 @@ def get_learner_fn(
 
 
 def learner_setup(
-    env: MarlEnv, keys: chex.Array, config: DictConfig
+    env: MarlEnv, keys: jax.Array, config: DictConfig
 ) -> Tuple[LearnerFn[LearnerState], Callable, LearnerState]:
     """Initialise learner_fn, network, optimiser, environment and states."""
     # Get available TPU cores.

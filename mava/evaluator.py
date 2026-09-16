@@ -20,9 +20,9 @@ from typing import Any, Callable, Dict, Protocol, Tuple, Union
 import jax
 import jax.numpy as jnp
 import numpy as np
-from chex import Array, PRNGKey
+from chex import PRNGKey
 from flax.core.frozen_dict import FrozenDict
-from jax import tree
+from jax import Array, tree
 from jumanji.types import TimeStep
 from omegaconf import DictConfig
 from typing_extensions import TypeAlias
@@ -198,8 +198,8 @@ def make_rec_eval_act_fn(actor_apply_fn: RecActorApply, config: DictConfig) -> E
         hidden_state = actor_state[_hidden_state]
 
         n_agents = timestep.observation.agents_view.shape[1]
-        last_done = timestep.last()[:, jnp.newaxis].repeat(n_agents, axis=-1)
-        ac_in = (timestep.observation, last_done)
+        prev_done = timestep.last()[:, jnp.newaxis].repeat(n_agents, axis=-1)
+        ac_in = (timestep.observation, prev_done)
         ac_in = add_batch_dim(ac_in)
 
         hidden_state, pi = actor_apply_fn(params, hidden_state, ac_in)
