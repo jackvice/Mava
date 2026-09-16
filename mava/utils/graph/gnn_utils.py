@@ -168,7 +168,7 @@ def batch(graphs: List[GraphsTuple]) -> GraphsTuple:
         concat = lambda *args: jnp.concatenate(args)
         return jax.tree.map(concat, *nests)
 
-    def _offset_node_indices(indices: chex.Array, offset: chex.Array) -> chex.Array:
+    def _offset_node_indices(indices: jax.Array, offset: jax.Array) -> jax.Array:
         """Shifts node indices by `offset`, leaving negative padding sentinels intact.
 
         Wrappers pad unused edges with -1 so that jraph's segment operations discard them.
