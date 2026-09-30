@@ -1,0 +1,10 @@
+# The config of the simple_spread scenario with more agents than landmarks.
+# Unlike the symmetric simple_spread_{3,5,10}ag scenarios, agents outnumber landmarks here,
+# so the agents cannot all occupy a distinct goal and some must share or stay clear.
+name: MPE_simple_spread_v3
+task_name: simple_spread_15ag_10lm
+
+task_config:
+  num_agents: 15
+  num_landmarks: 10
+  local_ratio: 0.5

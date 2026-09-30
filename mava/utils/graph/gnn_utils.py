@@ -123,25 +123,39 @@ def batched_graph_to_single_graph(graph: GraphsTuple, num_batch_dims: int = 1) -
     """
     validate_num_dims_in_graph_tuple(graph, num_batch_dims)
 
-    # concatenate the batch dimensions while retaining the feature dimensions
+    # collapse the batch dimensions into a single leading sub-graph dimension
     graph = jax.tree.map(lambda x: x.reshape(-1, *x.shape[num_batch_dims:]), graph)
 
-    # split the batch dimension into a list of graphs
-    batched_graphs = jax.tree.map(
-        lambda x: jnp.split(x, x.shape[0], axis=0),
-        graph,
+    # Offset of each sub-graph's nodes once the node arrays are concatenated, i.e. the
+    # exclusive cumulative sum of the per-sub-graph node counts. This mirrors `batch` but
+    # stays vectorised: building a Python list of sub-graphs emits one concatenate operand
+    # per sub-graph, and there are `timesteps * envs * agents` of them, so tracing and
+    # compilation blow up long before the data does.
+    nodes_per_graph = jnp.sum(graph.n_node, axis=-1)
+    offsets = jnp.concatenate(
+        [jnp.zeros((1,), dtype=nodes_per_graph.dtype), jnp.cumsum(nodes_per_graph)[:-1]]
+    )[:, jnp.newaxis]
+
+    graph = graph._replace(
+        senders=_offset_node_indices(graph.senders, offsets) if graph.senders is not None else None,
+        receivers=(
+            _offset_node_indices(graph.receivers, offsets) if graph.receivers is not None else None
+        ),
+        ego_node_index=graph.ego_node_index + offsets,
     )
 
-    # remove the batch dimension from the feature dimensions
-    batched_graphs = jax.tree.map(lambda y: jnp.squeeze(y, axis=0), batched_graphs)
+    # concatenate the sub-graphs by folding their dimension into the leading one
+    return jax.tree.map(lambda x: x.reshape(-1, *x.shape[2:]), graph)
 
-    # convert graph of lists into a list of graphs
-    list_of_graphs = jax.tree.transpose(
-        outer_treedef=jax.tree.structure(graph),
-        inner_treedef=None,  # Let JAX infer the inner (list) structure
-        pytree_to_transpose=batched_graphs,
-    )
-    return batch(list_of_graphs)
+
+def _offset_node_indices(indices: jax.Array, offset: jax.Array) -> jax.Array:
+    """Shifts node indices by `offset`, leaving negative padding sentinels intact.
+
+    Wrappers pad unused edges with -1 so that jraph's segment operations discard them.
+    Adding the offset unconditionally would turn -1 into a valid index for the previous
+    sub-graph's last node, silently injecting spurious messages.
+    """
+    return jnp.where(indices < 0, indices, indices + offset)
 
 
 def batch(graphs: List[GraphsTuple]) -> GraphsTuple:
@@ -167,15 +181,6 @@ def batch(graphs: List[GraphsTuple]) -> GraphsTuple:
     def _map_concat(nests: List[chex.ArrayTree]) -> chex.ArrayTree:
         concat = lambda *args: jnp.concatenate(args)
         return jax.tree.map(concat, *nests)
-
-    def _offset_node_indices(indices: jax.Array, offset: jax.Array) -> jax.Array:
-        """Shifts node indices by `offset`, leaving negative padding sentinels intact.
-
-        Wrappers pad unused edges with -1 so that jraph's segment operations discard them.
-        Adding the offset unconditionally would turn -1 into a valid index for the previous
-        sub-graph's last node, silently injecting spurious messages.
-        """
-        return jnp.where(indices < 0, indices, indices + offset)
 
     return GraphsTuple(
         n_node=jnp.concatenate([g.n_node for g in graphs]),
